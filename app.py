@@ -360,30 +360,29 @@ def fetch_shopify_products(shop_url: str, token: str) -> list:
     return [map_shopify_product(p) for p in products if p.get("title")]
 
 
-# ── Load Products (Shopify-first, JSON fallback) ───────────────────────────────
+# ── Load Products (Shopify only) ───────────────────────────────────────────────
 @st.cache_data(ttl=3600)  # refresh from Shopify every hour
 def load_products():
     shop_url = os.getenv("SHOPIFY_SHOP_URL", "").strip()
     token = os.getenv("SHOPIFY_ACCESS_TOKEN", "").strip()
 
-    if shop_url and token:
-        with st.spinner("Loading your live product catalog from Shopify…"):
-            products = fetch_shopify_products(shop_url, token)
-        if products:
-            return products, "shopify"
+    if not shop_url or not token:
+        st.error("Missing Shopify credentials. Add SHOPIFY_SHOP_URL and SHOPIFY_ACCESS_TOKEN to your .env file.")
+        st.stop()
 
-    # Fallback to local products.json
-    with open("products.json", "r", encoding="utf-8") as f:
-        return json.load(f)["products"], "json"
+    with st.spinner("Loading live product catalog from Shopify…"):
+        products = fetch_shopify_products(shop_url, token)
 
-_products, _source = load_products()
-ALL_PRODUCTS = _products
+    if not products:
+        st.error("No products returned from Shopify. Check your access token and store URL.")
+        st.stop()
+
+    return products
+
+ALL_PRODUCTS = load_products()
 PRODUCTS_BY_ID = {p["id"]: p for p in ALL_PRODUCTS}
 
-if _source == "shopify":
-    st.sidebar.success(f"✓ Live catalog: {len(ALL_PRODUCTS)} products from Shopify")
-else:
-    st.sidebar.info(f"📦 Local catalog: {len(ALL_PRODUCTS)} products (products.json)")
+st.sidebar.success(f"✓ Live catalog: {len(ALL_PRODUCTS)} products from Shopify")
 
 
 def build_catalog_text(products: list) -> str:
