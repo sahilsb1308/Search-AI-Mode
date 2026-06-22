@@ -1,6 +1,8 @@
 import streamlit as st
 import json
 import os
+import re
+import requests
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -240,33 +242,164 @@ hr { border-color: #2a2a2a !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Load Products ──────────────────────────────────────────────────────────────
-@st.cache_data
-def load_products():
-    with open("products.json", "r", encoding="utf-8") as f:
-        return json.load(f)["products"]
+# ── Shopify → our schema ───────────────────────────────────────────────────────
 
-ALL_PRODUCTS = load_products()
+CATEGORY_EMOJI = {
+    "lipstick": "💄", "lip gloss": "✨", "lip liner": "✏️", "lip": "💄",
+    "foundation": "🏺", "concealer": "🎭", "bb cream": "🧴", "cc cream": "🧴",
+    "eyeshadow": "👁️", "eyeliner": "✒️", "kajal": "✏️", "mascara": "👁️",
+    "eyebrow": "✏️", "eye": "👁️",
+    "blush": "🌸", "bronzer": "☀️", "highlighter": "✨", "contour": "🎨",
+    "primer": "🧴", "setting spray": "💨", "setting powder": "🌬️",
+    "powder": "💠", "compact": "💠",
+    "face": "✨", "skin": "🧴",
+}
+
+SKIN_TYPE_KEYWORDS = {"oily", "dry", "combination", "normal", "sensitive", "all"}
+FINISH_KEYWORDS = {"matte", "glossy", "satin", "dewy", "shimmer", "glitter", "natural", "luminous"}
+
+def _strip_html(html: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", html or "")
+    text = re.sub(r"&nbsp;", " ", text)
+    text = re.sub(r"&amp;", "&", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:200]  # keep compact — 422 products, watch token count
+
+def _get_emoji(product_type: str, title: str) -> str:
+    combined = (product_type + " " + title).lower()
+    for keyword, emoji in CATEGORY_EMOJI.items():
+        if keyword in combined:
+            return emoji
+    return "✨"
+
+def _extract_shades(shopify_product: dict) -> list:
+    # Shopify stores shades as variant options — option name contains "color"/"shade"
+    for option in shopify_product.get("options", []):
+        name = option["name"].lower()
+        if "color" in name or "colour" in name or "shade" in name or name == "finish":
+            vals = option.get("values", [])
+            return [v for v in vals if v.lower() not in ("default title", "default")]
+    # Fallback: variant titles
+    titles = [v["title"] for v in shopify_product.get("variants", [])
+              if v.get("title", "").lower() not in ("default title", "default")]
+    return titles[:12]
+
+def _extract_from_tags(tags_str: str):
+    tags = [t.strip().lower() for t in tags_str.split(",") if t.strip()]
+    skin_type = [t for t in tags if t in SKIN_TYPE_KEYWORDS] or ["all"]
+    finish = next((t.title() for t in tags if t in FINISH_KEYWORDS), None)
+    return tags, skin_type, finish
+
+def _min_price(shopify_product: dict) -> float:
+    prices = []
+    for v in shopify_product.get("variants", []):
+        try:
+            prices.append(float(v["price"]))
+        except (KeyError, ValueError):
+            pass
+    return min(prices) if prices else 0.0
+
+def map_shopify_product(sp: dict) -> dict:
+    tags_str = sp.get("tags", "")
+    tags, skin_type, finish_from_tags = _extract_from_tags(tags_str)
+    product_type = sp.get("product_type", "Beauty").strip() or "Beauty"
+    price = _min_price(sp)
+    shades = _extract_shades(sp)
+
+    return {
+        "id": f"shopify-{sp['id']}",
+        "name": sp.get("title", ""),
+        "category": product_type,
+        "subcategory": product_type,
+        "price": int(price),
+        "description": _strip_html(sp.get("body_html", "")),
+        "shades": shades,
+        "skin_type": skin_type,
+        "finish": finish_from_tags,
+        "coverage": None,
+        "wear_time": None,
+        "tags": tags,
+        "ideal_for": [],
+        "emoji": _get_emoji(product_type, sp.get("title", "")),
+        "shopify_handle": sp.get("handle", ""),
+    }
+
+
+def fetch_shopify_products(shop_url: str, token: str) -> list:
+    """Paginate through all Shopify products and return mapped list."""
+    shop_url = shop_url.rstrip("/")
+    base = f"https://{shop_url}/admin/api/2024-01/products.json"
+    headers = {"X-Shopify-Access-Token": token}
+    products = []
+    params = {"limit": 250, "status": "active", "fields":
+              "id,title,body_html,product_type,tags,variants,options,handle"}
+    page = 1
+
+    while True:
+        resp = requests.get(base, headers=headers, params=params, timeout=15)
+        if resp.status_code != 200:
+            st.warning(f"Shopify API error {resp.status_code}: {resp.text[:200]}")
+            break
+        data = resp.json().get("products", [])
+        if not data:
+            break
+        products.extend(data)
+        # Shopify uses Link header for cursor-based pagination
+        link = resp.headers.get("Link", "")
+        if 'rel="next"' not in link:
+            break
+        # Extract the page_info cursor from the Link header
+        next_url = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        if not next_url:
+            break
+        import urllib.parse as urlparse
+        qs = urlparse.parse_qs(urlparse.urlparse(next_url.group(1)).query)
+        params = {"limit": 250, "page_info": qs.get("page_info", [""])[0]}
+        page += 1
+
+    return [map_shopify_product(p) for p in products if p.get("title")]
+
+
+# ── Load Products (Shopify-first, JSON fallback) ───────────────────────────────
+@st.cache_data(ttl=3600)  # refresh from Shopify every hour
+def load_products():
+    shop_url = os.getenv("SHOPIFY_SHOP_URL", "").strip()
+    token = os.getenv("SHOPIFY_ACCESS_TOKEN", "").strip()
+
+    if shop_url and token:
+        with st.spinner("Loading your live product catalog from Shopify…"):
+            products = fetch_shopify_products(shop_url, token)
+        if products:
+            return products, "shopify"
+
+    # Fallback to local products.json
+    with open("products.json", "r", encoding="utf-8") as f:
+        return json.load(f)["products"], "json"
+
+_products, _source = load_products()
+ALL_PRODUCTS = _products
 PRODUCTS_BY_ID = {p["id"]: p for p in ALL_PRODUCTS}
+
+if _source == "shopify":
+    st.sidebar.success(f"✓ Live catalog: {len(ALL_PRODUCTS)} products from Shopify")
+else:
+    st.sidebar.info(f"📦 Local catalog: {len(ALL_PRODUCTS)} products (products.json)")
 
 
 def build_catalog_text(products: list) -> str:
-    lines = ["=== SWISS BEAUTY PRODUCT CATALOG ===\n"]
+    # Compact single-line format — keeps token count manageable for 400+ products
+    lines = ["=== SWISS BEAUTY PRODUCT CATALOG (use exact IDs) ==="]
     for p in products:
-        shades_str = ", ".join(p.get("shades", [])[:8])
-        skin_str = ", ".join(p.get("skin_type", []))
-        tags_str = ", ".join(p.get("tags", []))
+        shades = ", ".join(p.get("shades", [])[:6])
+        skin = ", ".join(p.get("skin_type", [])) or "all"
+        tags = ", ".join(p.get("tags", [])[:6])
+        desc = (p.get("description") or "")[:120].replace("\n", " ")
         lines.append(
-            f"[ID: {p['id']}]\n"
-            f"  Name: {p['name']}\n"
-            f"  Category: {p['category']} ({p.get('subcategory', '')})\n"
-            f"  Price: ₹{p['price']}\n"
-            f"  Description: {p['description']}\n"
-            f"  Shades: {shades_str}\n"
-            f"  Skin Type: {skin_str} | Finish: {p.get('finish', 'N/A')} | Coverage: {p.get('coverage', 'N/A')}\n"
-            f"  Wear Time: {p.get('wear_time', 'N/A')}\n"
-            f"  Tags: {tags_str}\n"
-            f"  Ideal For: {', '.join(p.get('ideal_for', []))}\n"
+            f"ID:{p['id']} | {p['name']} | {p['category']} | ₹{p['price']}"
+            f" | {desc}"
+            + (f" | shades: {shades}" if shades else "")
+            + f" | skin: {skin}"
+            + (f" | tags: {tags}" if tags else "")
         )
     return "\n".join(lines)
 
